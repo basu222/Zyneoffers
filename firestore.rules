@@ -1,0 +1,109 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for secure authorization
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.admin == true ||
+        (request.auth.token.email != null && request.auth.token.email.lower() == 'buddepubasu123@gmail.com')
+      );
+    }
+
+    // Users collection:
+    // - Non-admin users can ONLY read their own profile document.
+    // - Non-admin users CANNOT modify isAdmin, isBanned, availableBalance, or lifetimeEarnings.
+    // - Only authorized administrator can read all users or modify administrative fields.
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow create: if isAuthenticated() && isOwner(userId) && (
+        !('isAdmin' in request.resource.data) ||
+        request.resource.data.isAdmin == false ||
+        isAdmin()
+      );
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          isOwner(userId) &&
+          (!('isAdmin' in request.resource.data) || request.resource.data.isAdmin == false) &&
+          (!('isBanned' in request.resource.data) || request.resource.data.isBanned == resource.data.isBanned) &&
+          (!('availableBalance' in request.resource.data) || request.resource.data.availableBalance == resource.data.availableBalance) &&
+          (!('lifetimeEarnings' in request.resource.data) || request.resource.data.lifetimeEarnings == resource.data.lifetimeEarnings)
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Offers collection (Brand tasks): Publicly readable, writeable ONLY by administrator
+    match /offers/{offerId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Withdrawals collection: Users can view their own, create Pending requests; ONLY admin can approve/reject/payout
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid && 
+        request.resource.data.status == 'Pending';
+      allow update, delete: if isAdmin();
+    }
+
+    // Transactions collection: User reads own, server/admin controls approval
+    match /transactions/{transactionId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // Notifications collection: User reads own, updates isRead status
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // Banners collection: Publicly readable, writeable ONLY by administrator
+    match /banners/{bannerId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Announcements collection: Publicly readable, writeable ONLY by administrator
+    match /announcements/{announcementId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Global Settings collection: Publicly readable, writeable ONLY by administrator
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Referrals collection: Read by referrer/friend/admin; create when friend joins; update on offer completion or admin
+    match /referrals/{referralId} {
+      allow read: if isAuthenticated() && (
+        resource.data.referrerUserId == request.auth.uid || 
+        resource.data.friendUserId == request.auth.uid || 
+        isAdmin()
+      );
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Audit logs: Strictly administrator ONLY (Both Read and Write)
+    match /audit_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
