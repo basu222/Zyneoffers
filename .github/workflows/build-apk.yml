@@ -32,6 +32,8 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -alias androiddebugkey -keypass android -storepass android \
             -dname "CN=Android Debug,O=Android,C=US"
+          echo "Keystore generated successfully"
+          ls -la debug.keystore
 
       - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
