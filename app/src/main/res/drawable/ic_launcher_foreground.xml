@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Official Zyne Stylized Z Monogram -->
+    <path
+        android:pathData="M34,32 L68,32 C71.3,32 74,34.7 74,38 L74,44 L52,44 L44,64 L68,64 C71.3,64 74,66.7 74,70 L74,76 L40,76 C36.7,76 34,73.3 34,70 L34,64 L56,64 L64,44 L40,44 C36.7,44 34,41.3 34,38 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="74"
+                android:endY="76"
+                android:startX="34"
+                android:startY="32"
+                android:type="linear">
+                <item android:color="#FF8B5CF6" android:offset="0.0" />
+                <item android:color="#FF6C3FE8" android:offset="0.6" />
+                <item android:color="#FF5B21B6" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
