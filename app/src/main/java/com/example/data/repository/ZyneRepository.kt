@@ -76,7 +76,7 @@ class ZyneRepository(context: Context) {
                 }
             }
 
-            // Start Firebase Firestore real-time synchronization for global collections
+            // Start Firebase Firestore real-time synchronization for all collections
             firebaseManager.startRealtimeSync(
                 scope = coroutineScope,
                 onOffersUpdated = { offers ->
@@ -102,6 +102,15 @@ class ZyneRepository(context: Context) {
                 },
                 onWithdrawalsUpdated = { withdrawals ->
                     withdrawals.forEach { withdrawalDao.insertOrUpdateWithdrawal(it) }
+                },
+                onUsersUpdated = { users ->
+                    users.forEach { userDao.insertOrUpdateUser(it) }
+                },
+                onTransactionsUpdated = { transactions ->
+                    transactions.forEach { transactionDao.insertTransaction(it) }
+                },
+                onReferralsUpdated = { referrals ->
+                    referralDao.insertOrUpdateReferrals(referrals)
                 }
             )
         }
@@ -179,7 +188,7 @@ class ZyneRepository(context: Context) {
                     deviceId = deviceId,
                     displayName = displayName.ifBlank { existingUser.displayName },
                     photoUrl = photoUrl.ifBlank { existingUser.photoUrl },
-                    isAdmin = isAuthorizedAdmin
+                    isAdmin = isAuthorizedAdmin || existingUser.isAdmin
                 )
                 userDao.insertOrUpdateUser(updatedUser)
                 firebaseManager.saveUser(updatedUser)
@@ -302,9 +311,12 @@ class ZyneRepository(context: Context) {
         }
     }
 
+    /**
+     * Submit withdrawal request using atomic Firestore transaction
+     */
     suspend fun requestWithdrawal(userId: String, amount: Double, upiId: String): Result<WithdrawalEntity> {
         return withContext(Dispatchers.IO) {
-            val user = userDao.getUserByIdDirect(userId)
+            val user = userDao.getUserByIdDirect(userId) ?: firebaseManager.fetchUserById(userId)
                 ?: return@withContext Result.failure(Exception("User not found"))
 
             val settings = settingsDao.getSettingsDirect() ?: SettingsEntity()
@@ -313,7 +325,7 @@ class ZyneRepository(context: Context) {
             }
 
             if (amount > user.availableBalance) {
-                return@withContext Result.failure(Exception("Amount exceeds available balance ₹${user.availableBalance}"))
+                return@withContext Result.failure(Exception("Amount exceeds available balance ₹${user.availableBalance.toInt()}"))
             }
 
             val cleanedUpi = upiId.trim()
@@ -323,43 +335,41 @@ class ZyneRepository(context: Context) {
 
             val pending = withdrawalDao.getPendingWithdrawalByUserId(userId)
             if (pending != null) {
-                return@withContext Result.failure(Exception("You already have a pending withdrawal request of ₹${pending.amount}. Please wait until it is processed."))
+                return@withContext Result.failure(Exception("You already have a pending withdrawal request of ₹${pending.amount.toInt()}. Please wait until it is processed."))
             }
 
-            val withdrawal = WithdrawalEntity(
-                id = "WD_${System.currentTimeMillis()}",
+            // Call atomic server transaction
+            val result = firebaseManager.requestWithdrawalAtomic(
                 userId = userId,
-                userName = user.displayName,
                 amount = amount,
                 upiId = cleanedUpi,
-                status = "Pending",
-                requestedAt = System.currentTimeMillis()
+                userName = user.displayName,
+                minWithdrawalAmount = settings.minWithdrawalAmount
             )
-            withdrawalDao.insertOrUpdateWithdrawal(withdrawal)
-            firebaseManager.saveWithdrawal(withdrawal)
 
-            val tx = TransactionEntity(
-                id = "TX_${System.currentTimeMillis()}",
-                userId = userId,
-                type = "Withdrawal Requested",
-                amount = amount,
-                status = "Pending",
-                note = "UPI: $cleanedUpi"
-            )
-            transactionDao.insertTransaction(tx)
-            firebaseManager.saveTransaction(tx)
+            if (result.isSuccess) {
+                val withdrawal = result.getOrThrow()
+                withdrawalDao.insertOrUpdateWithdrawal(withdrawal)
 
-            val notif = NotificationEntity(
-                id = UUID.randomUUID().toString(),
-                userId = userId,
-                title = "Withdrawal Submitted",
-                message = "Your withdrawal request for ₹${amount.toInt()} via UPI ($cleanedUpi) is now Pending operator review.",
-                type = "WITHDRAWAL"
-            )
-            notificationDao.insertNotification(notif)
-            firebaseManager.saveNotification(notif)
+                // Update local cached balance
+                val updatedUser = user.copy(
+                    availableBalance = user.availableBalance - amount,
+                    pendingBalance = user.pendingBalance + amount
+                )
+                userDao.insertOrUpdateUser(updatedUser)
 
-            Result.success(withdrawal)
+                val tx = TransactionEntity(
+                    id = "TX_WD_${withdrawal.id}",
+                    userId = userId,
+                    type = "Withdrawal Requested",
+                    amount = amount,
+                    status = "Pending",
+                    note = "UPI: $cleanedUpi"
+                )
+                transactionDao.insertTransaction(tx)
+            }
+
+            result
         }
     }
 
@@ -428,7 +438,7 @@ class ZyneRepository(context: Context) {
                 userDao.insertOrUpdateUser(updatedUser)
 
                 val tx = TransactionEntity(
-                    id = "TX_${System.currentTimeMillis()}",
+                    id = "TX_REW_$safeCompRef",
                     userId = userId,
                     type = "Reward Credited",
                     amount = amount,
@@ -436,59 +446,6 @@ class ZyneRepository(context: Context) {
                     note = "$offerName (Ref: $safeCompRef) - $note"
                 )
                 transactionDao.insertTransaction(tx)
-
-                val notif = NotificationEntity(
-                    id = UUID.randomUUID().toString(),
-                    userId = userId,
-                    title = "Reward Credited! 🎉",
-                    message = "₹${amount.toInt()} credited for offer: $offerName",
-                    type = "REWARD"
-                )
-                notificationDao.insertNotification(notif)
-
-                // Check Referral Rule locally:
-                if (user.referredByCode.isNotBlank()) {
-                    val referral = referralDao.getReferralForFriend(userId)
-                    if (referral != null && !referral.isQualified) {
-                        val bonusAmount = 10.0
-                        val updatedRef = referral.copy(
-                            isQualified = true,
-                            status = "COMPLETED_REWARDED",
-                            offerId = offerName,
-                            bonusAmount = bonusAmount,
-                            completedAt = System.currentTimeMillis()
-                        )
-                        referralDao.insertOrUpdateReferral(updatedRef)
-
-                        val referrer = userDao.getUserByIdDirect(user.referredByCode) ?: firebaseManager.fetchUserById(user.referredByCode)
-                        if (referrer != null) {
-                            val updatedReferrer = referrer.copy(
-                                availableBalance = referrer.availableBalance + bonusAmount,
-                                lifetimeEarnings = referrer.lifetimeEarnings + bonusAmount
-                            )
-                            userDao.insertOrUpdateUser(updatedReferrer)
-
-                            val refTx = TransactionEntity(
-                                id = "TX_REF_${System.currentTimeMillis()}_${userId}",
-                                userId = referrer.userId,
-                                type = "Referral Bonus",
-                                amount = bonusAmount,
-                                status = "Approved",
-                                note = "Referral reward: ₹10 for friend ${user.displayName} ($userId) completing first offer ($offerName)"
-                            )
-                            transactionDao.insertTransaction(refTx)
-
-                            val refNotif = NotificationEntity(
-                                id = UUID.randomUUID().toString(),
-                                userId = referrer.userId,
-                                title = "Referral Bonus Credited! 🎁",
-                                message = "₹10 credited to your wallet! Your referred friend ${user.displayName} completed their first offer ($offerName).",
-                                type = "REFERRAL"
-                            )
-                            notificationDao.insertNotification(refNotif)
-                        }
-                    }
-                }
             }
 
             val auditLog = AuditLogEntity(
@@ -498,7 +455,6 @@ class ZyneRepository(context: Context) {
                 details = "Credited ₹$amount to user $userId for offer '$offerName' [Ref: $safeCompRef]. Note: $note"
             )
             auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
 
             Result.success("Reward of ₹${amount.toInt()} credited successfully to $userId")
         }
@@ -538,126 +494,128 @@ class ZyneRepository(context: Context) {
         }
     }
 
-    suspend fun adminApproveWithdrawal(withdrawalId: String, adminEmail: String) {
-        withContext(Dispatchers.IO) {
-            val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
-            val withdrawal = allWd.find { it.id == withdrawalId } ?: return@withContext
-
-            val updated = withdrawal.copy(
-                status = "Approved",
-                approvedAt = System.currentTimeMillis()
-            )
-            withdrawalDao.updateWithdrawal(updated)
-            firebaseManager.saveWithdrawal(updated)
-
-            val notif = NotificationEntity(
-                id = UUID.randomUUID().toString(),
-                userId = withdrawal.userId,
-                title = "Withdrawal Approved ✅",
-                message = "Your withdrawal of ₹${withdrawal.amount.toInt()} has been approved and is being processed for UPI payout.",
-                type = "WITHDRAWAL"
-            )
-            notificationDao.insertNotification(notif)
-            firebaseManager.saveNotification(notif)
-
-            val auditLog = AuditLogEntity(
-                id = UUID.randomUUID().toString(),
-                adminEmail = adminEmail,
-                action = "APPROVE_WITHDRAWAL",
-                details = "Approved withdrawal $withdrawalId of ₹${withdrawal.amount} for user ${withdrawal.userId}"
-            )
-            auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
-        }
-    }
-
-    suspend fun adminMarkWithdrawalPaid(withdrawalId: String, adminEmail: String) {
-        withContext(Dispatchers.IO) {
-            val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
-            val withdrawal = allWd.find { it.id == withdrawalId } ?: return@withContext
-
-            val user = userDao.getUserByIdDirect(withdrawal.userId) ?: return@withContext
-            if (user.availableBalance >= withdrawal.amount) {
-                val updatedUser = user.copy(
-                    availableBalance = user.availableBalance - withdrawal.amount,
-                    totalWithdrawals = user.totalWithdrawals + withdrawal.amount
-                )
-                userDao.updateUser(updatedUser)
-                firebaseManager.saveUser(updatedUser)
+    suspend fun adminApproveWithdrawal(withdrawalId: String, adminEmail: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            val result = firebaseManager.adminApproveWithdrawalAtomic(withdrawalId, adminEmail)
+            if (result.isSuccess) {
+                val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
+                val withdrawal = allWd.find { it.id == withdrawalId }
+                if (withdrawal != null) {
+                    val updated = withdrawal.copy(
+                        status = "Approved",
+                        approvedAt = System.currentTimeMillis()
+                    )
+                    withdrawalDao.insertOrUpdateWithdrawal(updated)
+                }
             }
-
-            val updatedWd = withdrawal.copy(
-                status = "Paid",
-                paidAt = System.currentTimeMillis()
-            )
-            withdrawalDao.updateWithdrawal(updatedWd)
-            firebaseManager.saveWithdrawal(updatedWd)
-
-            val tx = TransactionEntity(
-                id = "TX_PAID_${System.currentTimeMillis()}",
-                userId = withdrawal.userId,
-                type = "Withdrawal Paid",
-                amount = withdrawal.amount,
-                status = "Paid",
-                note = "Paid out to UPI: ${withdrawal.upiId}"
-            )
-            transactionDao.insertTransaction(tx)
-            firebaseManager.saveTransaction(tx)
-
-            val notif = NotificationEntity(
-                id = UUID.randomUUID().toString(),
-                userId = withdrawal.userId,
-                title = "UPI Payment Sent! 💸",
-                message = "₹${withdrawal.amount.toInt()} has been transferred to your UPI ID ${withdrawal.upiId}.",
-                type = "WITHDRAWAL"
-            )
-            notificationDao.insertNotification(notif)
-            firebaseManager.saveNotification(notif)
-
-            val auditLog = AuditLogEntity(
-                id = UUID.randomUUID().toString(),
-                adminEmail = adminEmail,
-                action = "MARK_WITHDRAWAL_PAID",
-                details = "Marked withdrawal $withdrawalId paid out ₹${withdrawal.amount} to ${withdrawal.upiId}"
-            )
-            auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
+            result
         }
     }
 
-    suspend fun adminRejectWithdrawal(withdrawalId: String, reason: String, adminEmail: String) {
-        withContext(Dispatchers.IO) {
-            val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
-            val withdrawal = allWd.find { it.id == withdrawalId } ?: return@withContext
+    suspend fun adminMarkWithdrawalPaid(withdrawalId: String, adminEmail: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            val result = firebaseManager.adminMarkWithdrawalPaidAtomic(withdrawalId, adminEmail)
+            if (result.isSuccess) {
+                val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
+                val withdrawal = allWd.find { it.id == withdrawalId }
+                if (withdrawal != null && withdrawal.status != "Paid") {
+                    val updatedWd = withdrawal.copy(
+                        status = "Paid",
+                        paidAt = System.currentTimeMillis()
+                    )
+                    withdrawalDao.insertOrUpdateWithdrawal(updatedWd)
 
-            val updatedWd = withdrawal.copy(
-                status = "Rejected",
-                rejectionReason = reason
-            )
-            withdrawalDao.updateWithdrawal(updatedWd)
-            firebaseManager.saveWithdrawal(updatedWd)
+                    val user = userDao.getUserByIdDirect(withdrawal.userId)
+                    if (user != null) {
+                        val updatedUser = user.copy(
+                            pendingBalance = kotlin.math.max(0.0, user.pendingBalance - withdrawal.amount),
+                            totalWithdrawals = user.totalWithdrawals + withdrawal.amount
+                        )
+                        userDao.insertOrUpdateUser(updatedUser)
+                    }
 
-            val notif = NotificationEntity(
-                id = UUID.randomUUID().toString(),
-                userId = withdrawal.userId,
-                title = "Withdrawal Rejected",
-                message = "Your withdrawal of ₹${withdrawal.amount.toInt()} was rejected. Reason: $reason",
-                type = "WITHDRAWAL"
-            )
-            notificationDao.insertNotification(notif)
-            firebaseManager.saveNotification(notif)
-
-            val auditLog = AuditLogEntity(
-                id = UUID.randomUUID().toString(),
-                adminEmail = adminEmail,
-                action = "REJECT_WITHDRAWAL",
-                details = "Rejected withdrawal $withdrawalId for user ${withdrawal.userId}. Reason: $reason"
-            )
-            auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
+                    val tx = TransactionEntity(
+                        id = "TX_PAID_$withdrawalId",
+                        userId = withdrawal.userId,
+                        type = "Withdrawal Paid",
+                        amount = withdrawal.amount,
+                        status = "Paid",
+                        note = "Paid out to UPI: ${withdrawal.upiId}"
+                    )
+                    transactionDao.insertTransaction(tx)
+                }
+            }
+            result
         }
     }
 
+    suspend fun adminRejectWithdrawal(withdrawalId: String, reason: String, adminEmail: String): Result<String> {
+        return withContext(Dispatchers.IO) {
+            val result = firebaseManager.adminRejectWithdrawalAtomic(withdrawalId, reason, adminEmail)
+            if (result.isSuccess) {
+                val allWd = withdrawalDao.getAllWithdrawals().firstOrNull() ?: emptyList()
+                val withdrawal = allWd.find { it.id == withdrawalId }
+                if (withdrawal != null && withdrawal.status != "Rejected") {
+                    val updatedWd = withdrawal.copy(
+                        status = "Rejected",
+                        rejectionReason = reason
+                    )
+                    withdrawalDao.insertOrUpdateWithdrawal(updatedWd)
+
+                    val user = userDao.getUserByIdDirect(withdrawal.userId)
+                    if (user != null) {
+                        val updatedUser = user.copy(
+                            availableBalance = user.availableBalance + withdrawal.amount,
+                            pendingBalance = kotlin.math.max(0.0, user.pendingBalance - withdrawal.amount)
+                        )
+                        userDao.insertOrUpdateUser(updatedUser)
+                    }
+
+                    val tx = TransactionEntity(
+                        id = "TX_REFUND_$withdrawalId",
+                        userId = withdrawal.userId,
+                        type = "Withdrawal Refund",
+                        amount = withdrawal.amount,
+                        status = "Approved",
+                        note = "Refund for rejected withdrawal: $reason"
+                    )
+                    transactionDao.insertTransaction(tx)
+                }
+            }
+            result
+        }
+    }
+
+    suspend fun adminToggleUserBan(userId: String, adminEmail: String): Result<Boolean> {
+        return withContext(Dispatchers.IO) {
+            val result = firebaseManager.toggleUserBanAtomic(userId, adminEmail)
+            if (result.isSuccess) {
+                val newBanState = result.getOrThrow()
+                val user = userDao.getUserByIdDirect(userId)
+                if (user != null) {
+                    val updated = user.copy(isBanned = newBanState)
+                    userDao.insertOrUpdateUser(updated)
+                }
+            }
+            result
+        }
+    }
+
+    suspend fun adminResetDeviceBinding(userId: String, adminEmail: String): Result<Unit> {
+        return withContext(Dispatchers.IO) {
+            val result = firebaseManager.resetDeviceBindingAtomic(userId, adminEmail)
+            if (result.isSuccess) {
+                val user = userDao.getUserByIdDirect(userId)
+                if (user != null) {
+                    val updated = user.copy(deviceId = "RESET_${System.currentTimeMillis()}")
+                    userDao.insertOrUpdateUser(updated)
+                }
+            }
+            result
+        }
+    }
+
+    // --- ADMIN CRUD FOR OFFERS, BANNERS, ANNOUNCEMENTS, SETTINGS ---
     suspend fun adminSaveOffer(offer: OfferEntity, adminEmail: String) {
         withContext(Dispatchers.IO) {
             offerDao.insertOrUpdateOffer(offer)
@@ -667,7 +625,7 @@ class ZyneRepository(context: Context) {
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "SAVE_OFFER",
-                details = "Saved offer '${offer.name}' (ID: ${offer.id}, Reward: ₹${offer.rewardAmount})"
+                details = "Created/Updated offer: ${offer.name} (${offer.id})"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
@@ -683,7 +641,7 @@ class ZyneRepository(context: Context) {
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "DELETE_OFFER",
-                details = "Deleted offer $offerId"
+                details = "Deleted offer: $offerId"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
@@ -699,7 +657,7 @@ class ZyneRepository(context: Context) {
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "SAVE_BANNER",
-                details = "Saved banner '${banner.title}'"
+                details = "Saved banner: ${banner.title} (${banner.id})"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
@@ -715,7 +673,7 @@ class ZyneRepository(context: Context) {
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "DELETE_BANNER",
-                details = "Deleted banner $bannerId"
+                details = "Deleted banner: $bannerId"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
@@ -731,7 +689,23 @@ class ZyneRepository(context: Context) {
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "SAVE_ANNOUNCEMENT",
-                details = "Updated announcement content."
+                details = "Saved announcement: ${announcement.content.take(40)}..."
+            )
+            auditLogDao.insertAuditLog(auditLog)
+            firebaseManager.saveAuditLog(auditLog)
+        }
+    }
+
+    suspend fun adminDeleteAnnouncement(announcementId: String, adminEmail: String) {
+        withContext(Dispatchers.IO) {
+            announcementDao.deleteAnnouncement(announcementId)
+            firebaseManager.deleteAnnouncement(announcementId)
+
+            val auditLog = AuditLogEntity(
+                id = UUID.randomUUID().toString(),
+                adminEmail = adminEmail,
+                action = "DELETE_ANNOUNCEMENT",
+                details = "Deleted announcement: $announcementId"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
@@ -740,53 +714,14 @@ class ZyneRepository(context: Context) {
 
     suspend fun adminUpdateSettings(settings: SettingsEntity, adminEmail: String) {
         withContext(Dispatchers.IO) {
-            settingsDao.updateSettings(settings.copy(id = 1))
+            settingsDao.updateSettings(settings)
             firebaseManager.saveSettings(settings)
 
             val auditLog = AuditLogEntity(
                 id = UUID.randomUUID().toString(),
                 adminEmail = adminEmail,
                 action = "UPDATE_SETTINGS",
-                details = "Updated app settings (Maintenance: ${settings.isMaintenanceMode}, MinWD: ₹${settings.minWithdrawalAmount}, TrackingURL: ${settings.trackingUrl})"
-            )
-            auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
-        }
-    }
-
-    suspend fun adminToggleUserBan(userId: String, adminEmail: String) {
-        withContext(Dispatchers.IO) {
-            val user = userDao.getUserByIdDirect(userId) ?: return@withContext
-            val newBanState = !user.isBanned
-            val updated = user.copy(isBanned = newBanState)
-            userDao.updateUser(updated)
-            firebaseManager.saveUser(updated)
-
-            val auditLog = AuditLogEntity(
-                id = UUID.randomUUID().toString(),
-                adminEmail = adminEmail,
-                action = "TOGGLE_USER_BAN",
-                details = "User $userId ban status changed to $newBanState"
-            )
-            auditLogDao.insertAuditLog(auditLog)
-            firebaseManager.saveAuditLog(auditLog)
-        }
-    }
-
-    suspend fun adminResetDeviceBinding(userId: String, adminEmail: String) {
-        withContext(Dispatchers.IO) {
-            val newDeviceId = "RESET_${System.currentTimeMillis()}"
-            userDao.resetDeviceId(userId, newDeviceId)
-            val user = userDao.getUserByIdDirect(userId)
-            if (user != null) {
-                firebaseManager.saveUser(user)
-            }
-
-            val auditLog = AuditLogEntity(
-                id = UUID.randomUUID().toString(),
-                adminEmail = adminEmail,
-                action = "RESET_DEVICE_BINDING",
-                details = "Reset device binding for user $userId"
+                details = "Updated platform settings (Min WD: ₹${settings.minWithdrawalAmount}, Referral: ₹${settings.referralBonusAmount})"
             )
             auditLogDao.insertAuditLog(auditLog)
             firebaseManager.saveAuditLog(auditLog)
